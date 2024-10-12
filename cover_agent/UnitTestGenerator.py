@@ -1,18 +1,18 @@
+from wandb.sdk.data_types.trace_tree import Trace
 import datetime
+import json
 import logging
 import os
 import re
-import json
-from wandb.sdk.data_types.trace_tree import Trace
 
-from cover_agent.Runner import Runner
+from cover_agent.AICaller import AICaller
 from cover_agent.CoverageProcessor import CoverageProcessor
 from cover_agent.CustomLogger import CustomLogger
-from cover_agent.PromptBuilder import PromptBuilder
-from cover_agent.AICaller import AICaller
 from cover_agent.FilePreprocessor import FilePreprocessor
-from cover_agent.utils import load_yaml
+from cover_agent.PromptBuilder import PromptBuilder
+from cover_agent.Runner import Runner
 from cover_agent.settings.config_loader import get_settings
+from cover_agent.utils import load_yaml
 
 
 class UnitTestGenerator:
@@ -29,6 +29,7 @@ class UnitTestGenerator:
         coverage_type="cobertura",
         desired_coverage: int = 90,  # Default to 90% coverage if not specified
         additional_instructions: str = "",
+        use_report_coverage_feature_flag: bool = False,
     ):
         """
         Initialize the UnitTestGenerator class with the provided parameters.
@@ -45,6 +46,9 @@ class UnitTestGenerator:
             coverage_type (str, optional): The type of coverage report. Defaults to "cobertura".
             desired_coverage (int, optional): The desired coverage percentage. Defaults to 90.
             additional_instructions (str, optional): Additional instructions for test generation. Defaults to an empty string.
+            use_report_coverage_feature_flag (bool, optional): Setting this to True considers the coverage of all the files in the coverage report. 
+                                                               This means we consider a test as good if it increases coverage for a different 
+                                                               file other than the source file. Defaults to False.
 
         Returns:
             None
@@ -60,6 +64,9 @@ class UnitTestGenerator:
         self.desired_coverage = desired_coverage
         self.additional_instructions = additional_instructions
         self.language = self.get_code_language(source_file_path)
+        self.use_report_coverage_feature_flag = use_report_coverage_feature_flag
+        self.last_coverage_percentages = {}
+        self.llm_model = llm_model
 
         # Objects to instantiate
         self.ai_caller = AICaller(model=llm_model, api_base=api_base)
@@ -70,7 +77,22 @@ class UnitTestGenerator:
         # States to maintain within this class
         self.preprocessor = FilePreprocessor(self.test_file_path)
         self.failed_test_runs = []
+        self.total_input_token_count = 0
+        self.total_output_token_count = 0
+        self.testing_framework = "Unknown"
+        self.code_coverage_report = ""
 
+        # Read self.source_file_path into a string
+        with open(self.source_file_path, "r") as f:
+            self.source_code = f.read()
+
+    def get_coverage_and_build_prompt(self):
+        """
+        Run code coverage and build the prompt to be used for generating tests.
+
+        Returns:
+            None
+        """
         # Run coverage and build the prompt
         self.run_coverage()
         self.prompt = self.build_prompt()
@@ -136,15 +158,51 @@ class UnitTestGenerator:
             file_path=self.code_coverage_report_path,
             src_file_path=self.source_file_path,
             coverage_type=self.coverage_type,
+            use_report_coverage_feature_flag=self.use_report_coverage_feature_flag
         )
 
         # Use the process_coverage_report method of CoverageProcessor, passing in the time the test command was executed
         try:
-            lines_covered, lines_missed, percentage_covered = (
-                coverage_processor.process_coverage_report(
+            if self.use_report_coverage_feature_flag:
+                self.logger.info(
+                    "Using the report coverage feature flag to process the coverage report"
+                )
+                file_coverage_dict = coverage_processor.process_coverage_report(
                     time_of_test_command=time_of_test_command
                 )
-            )
+                total_lines_covered = 0
+                total_lines_missed = 0
+                total_lines = 0
+                for key in file_coverage_dict:
+                    lines_covered, lines_missed, percentage_covered = (
+                        file_coverage_dict[key]
+                    )
+                    total_lines_covered += len(lines_covered)
+                    total_lines_missed += len(lines_missed)
+                    total_lines += len(lines_covered) + len(lines_missed)
+                    if key == self.source_file_path:
+                        self.last_source_file_coverage = percentage_covered
+                    if key not in self.last_coverage_percentages:
+                        self.last_coverage_percentages[key] =  0
+                    self.last_coverage_percentages[key] = percentage_covered
+                try:
+                    percentage_covered = total_lines_covered / total_lines
+                except ZeroDivisionError:
+                    self.logger.error(f"ZeroDivisionError: Attempting to perform total_lines_covered / total_lines: {total_lines_covered} / {total_lines}.")
+                    percentage_covered = 0
+
+                self.logger.info(
+                    f"Total lines covered: {total_lines_covered}, Total lines missed: {total_lines_missed}, Total lines: {total_lines}"
+                )
+                self.logger.info(    
+                    f"coverage: Percentage {round(percentage_covered * 100, 2)}%"
+                )
+            else:
+                lines_covered, lines_missed, percentage_covered = (
+                    coverage_processor.process_coverage_report(
+                        time_of_test_command=time_of_test_command
+                    )
+                )
 
             # Process the extracted coverage metrics
             self.current_coverage = percentage_covered
@@ -187,7 +245,9 @@ class UnitTestGenerator:
             out_str = ""
             if included_files_content:
                 for i, content in enumerate(included_files_content):
-                    out_str += f"file_path: `{file_names[i]}`\ncontent:\n```\n{content}\n```\n"
+                    out_str += (
+                        f"file_path: `{file_names[i]}`\ncontent:\n```\n{content}\n```\n"
+                    )
 
             return out_str.strip()
         return ""
@@ -215,10 +275,7 @@ class UnitTestGenerator:
                         continue
                     # dump dict to str
                     code = json.dumps(failed_test_dict)
-                    if "error_message" in failed_test:
-                        error_message = failed_test["error_message"]
-                    else:
-                        error_message = None
+                    error_message = failed_test.get("error_message", None)
                     failed_test_runs_value += f"Failed Test:\n```\n{code}\n```\n"
                     if error_message:
                         failed_test_runs_value += (
@@ -242,24 +299,44 @@ class UnitTestGenerator:
             additional_instructions=self.additional_instructions,
             failed_test_runs=failed_test_runs_value,
             language=self.language,
+            testing_framework=self.testing_framework,
         )
 
         return self.prompt_builder.build_prompt()
 
     def initial_test_suite_analysis(self):
+        """
+        Perform the initial analysis of the test suite structure.
+
+        This method iterates through a series of attempts to analyze the test suite structure by interacting with the AI model.
+        It constructs prompts based on specific files and calls to the AI model to gather information such as test headers indentation,
+        relevant line numbers for inserting new tests, and relevant line numbers for inserting imports.
+        The method handles multiple attempts to gather this information and raises exceptions if the analysis fails.
+
+        Raises:
+            Exception: If the test headers indentation cannot be analyzed successfully.
+            Exception: If the relevant line number to insert new tests cannot be determined.
+
+        Returns:
+            None
+        """
         try:
             test_headers_indentation = None
             allowed_attempts = 3
             counter_attempts = 0
-            while test_headers_indentation is None and counter_attempts < allowed_attempts:
-                prompt_headers_indentation = (
-                    self.prompt_builder.build_prompt_custom(
-                        file="analyze_suite_test_headers_indentation"
-                    )
+            while (
+                test_headers_indentation is None and counter_attempts < allowed_attempts
+            ):
+                prompt_headers_indentation = self.prompt_builder.build_prompt_custom(
+                    file="analyze_suite_test_headers_indentation"
                 )
+                self.ai_caller.model = "gpt-4o" if self.llm_model in ["o1-preview", "o1-mini"] else self.llm_model # Exception for OpenAI's new reasoning engines
                 response, prompt_token_count, response_token_count = (
                     self.ai_caller.call_model(prompt=prompt_headers_indentation)
                 )
+                self.ai_caller.model = self.llm_model
+                self.total_input_token_count += prompt_token_count
+                self.total_output_token_count += response_token_count
                 tests_dict = load_yaml(response)
                 test_headers_indentation = tests_dict.get(
                     "test_headers_indentation", None
@@ -273,15 +350,20 @@ class UnitTestGenerator:
             relevant_line_number_to_insert_imports_after = None
             allowed_attempts = 3
             counter_attempts = 0
-            while not relevant_line_number_to_insert_tests_after and counter_attempts < allowed_attempts:
-                prompt_test_insert_line = (
-                    self.prompt_builder.build_prompt_custom(
-                        file="analyze_suite_test_insert_line"
-                    )
+            while (
+                not relevant_line_number_to_insert_tests_after
+                and counter_attempts < allowed_attempts
+            ):
+                prompt_test_insert_line = self.prompt_builder.build_prompt_custom(
+                    file="analyze_suite_test_insert_line"
                 )
+                self.ai_caller.model = "gpt-4o" if self.llm_model in ["o1-preview", "o1-mini"] else self.llm_model # Exception for OpenAI's new reasoning engines
                 response, prompt_token_count, response_token_count = (
                     self.ai_caller.call_model(prompt=prompt_test_insert_line)
                 )
+                self.ai_caller.model = self.llm_model
+                self.total_input_token_count += prompt_token_count
+                self.total_output_token_count += response_token_count
                 tests_dict = load_yaml(response)
                 relevant_line_number_to_insert_tests_after = tests_dict.get(
                     "relevant_line_number_to_insert_tests_after", None
@@ -289,6 +371,7 @@ class UnitTestGenerator:
                 relevant_line_number_to_insert_imports_after = tests_dict.get(
                     "relevant_line_number_to_insert_imports_after", None
                 )
+                self.testing_framework = tests_dict.get("testing_framework", "Unknown")
                 counter_attempts += 1
 
             if not relevant_line_number_to_insert_tests_after:
@@ -297,24 +380,42 @@ class UnitTestGenerator:
                 )
 
             self.test_headers_indentation = test_headers_indentation
-            self.relevant_line_number_to_insert_tests_after = relevant_line_number_to_insert_tests_after
-            self.relevant_line_number_to_insert_imports_after = relevant_line_number_to_insert_imports_after
+            self.relevant_line_number_to_insert_tests_after = (
+                relevant_line_number_to_insert_tests_after
+            )
+            self.relevant_line_number_to_insert_imports_after = (
+                relevant_line_number_to_insert_imports_after
+            )
         except Exception as e:
             self.logger.error(f"Error during initial test suite analysis: {e}")
             raise Exception("Error during initial test suite analysis")
 
-    def generate_tests(self, max_tokens=4096, dry_run=False):
+    def generate_tests(self, max_tokens=4096):
+        """
+        Generate tests using the AI model based on the constructed prompt.
+
+        This method generates tests by calling the AI model with the constructed prompt.
+        It handles both dry run and actual test generation scenarios. In a dry run, it returns canned test responses.
+        In the actual run, it calls the AI model with the prompt and processes the response to extract test
+        information such as test tags, test code, test name, and test behavior.
+
+        Parameters:
+            max_tokens (int, optional): The maximum number of tokens to use for generating tests. Defaults to 4096.
+
+        Returns:
+            dict: A dictionary containing the generated tests with test tags, test code, test name, and test behavior. If an error occurs during test generation, an empty dictionary is returned.
+
+        Raises:
+            Exception: If there is an error during test generation, such as a parsing error while processing the AI model response.
+        """
         self.prompt = self.build_prompt()
 
-        if dry_run:
-            response = "```def test_something():\n    pass```\n```def test_something_else():\n    pass```\n```def test_something_different():\n    pass```"
-        else:
-            response, prompt_token_count, response_token_count = (
-                self.ai_caller.call_model(prompt=self.prompt, max_tokens=max_tokens)
-            )
-        self.logger.info(
-            f"Total token used count for LLM model {self.ai_caller.model}: {prompt_token_count + response_token_count}"
+        stream = False if self.llm_model in ["o1-preview", "o1-mini"] else True
+        response, prompt_token_count, response_token_count = (
+            self.ai_caller.call_model(prompt=self.prompt, max_tokens=max_tokens, stream=stream)
         )
+        self.total_input_token_count += prompt_token_count
+        self.total_output_token_count += response_token_count
         try:
             tests_dict = load_yaml(
                 response,
@@ -338,20 +439,58 @@ class UnitTestGenerator:
 
         return tests_dict
 
-    def validate_test(self, generated_test: dict, generated_tests_dict: dict):
+    def validate_test(self, generated_test: dict, num_attempts=1):
+        """
+        Validate a generated test by inserting it into the test file, running the test, and checking for pass/fail.
+
+        Parameters:
+            generated_test (dict): The generated test to validate, containing test code and additional imports.
+            num_attempts (int, optional): The number of attempts to run the test. Defaults to 1.
+
+        Returns:
+            dict: A dictionary containing the status of the test validation, including pass/fail status, exit code, stderr, stdout, and the test details.
+
+        Steps:
+            0. Assume each generated test is a self-contained independent test.
+            1. Extract the test code and additional imports from the generated test.
+            2. Clean up the additional imports if necessary.
+            3. Determine the relevant line numbers for inserting tests and imports.
+            4. Adjust the indentation of the test code to match the required indentation.
+            5. Insert the test code and additional imports into the test file at the relevant lines.
+            6. Run the test using the Runner class.
+            7. Check the exit code to determine if the test passed or failed.
+            8. If the test failed, roll back the test file to its original content and log the failure.
+            9. If the test passed, check if the code coverage has increased using the CoverageProcessor class.
+            10. If the coverage has not increased, roll back the test file and log the failure.
+            11. If the coverage has increased, update the current coverage and log the success.
+            12. Handle any exceptions that occur during the validation process, log the errors, and roll back the test file if necessary.
+            13. Log additional details and error messages for failed tests, and optionally, use the Trace class for detailed logging if 'WANDB_API_KEY' is present in the environment variables.
+        """
+        # Store original content of the test file
+        with open(self.test_file_path, "r") as test_file:
+            original_content = test_file.read()
+
         try:
             # Step 0: no pre-process.
             # We asked the model that each generated test should be a self-contained independent test
             test_code = generated_test.get("test_code", "").rstrip()
             additional_imports = generated_test.get("new_imports_code", "").strip()
-            if additional_imports and additional_imports[0] == '"' and additional_imports[-1] == '"':
+            if (
+                additional_imports
+                and additional_imports[0] == '"'
+                and additional_imports[-1] == '"'
+            ):
                 additional_imports = additional_imports.strip('"')
 
             # check if additional_imports only contains '"':
             if additional_imports and additional_imports == '""':
                 additional_imports = ""
-            relevant_line_number_to_insert_tests_after = self.relevant_line_number_to_insert_tests_after
-            relevant_line_number_to_insert_imports_after = self.relevant_line_number_to_insert_imports_after
+            relevant_line_number_to_insert_tests_after = (
+                self.relevant_line_number_to_insert_tests_after
+            )
+            relevant_line_number_to_insert_imports_after = (
+                self.relevant_line_number_to_insert_imports_after
+            )
 
             needed_indent = self.test_headers_indentation
             # remove initial indent of the test code, and insert the needed indent
@@ -366,40 +505,52 @@ class UnitTestGenerator:
             test_code_indented = "\n" + test_code_indented.strip("\n") + "\n"
 
             if test_code_indented and relevant_line_number_to_insert_tests_after:
-
-                # Step 1: Append the generated test to the relevant line in the test file
-                with open(self.test_file_path, "r") as test_file:
-                    original_content = test_file.read()  # Store original content
+                # Step 1: Insert the generated test to the relevant line in the test file
+                additional_imports_lines = ""
                 original_content_lines = original_content.split("\n")
                 test_code_lines = test_code_indented.split("\n")
                 # insert the test code at the relevant line
                 processed_test_lines = (
                     original_content_lines[:relevant_line_number_to_insert_tests_after]
                     + test_code_lines
-                    + original_content_lines[relevant_line_number_to_insert_tests_after:]
+                    + original_content_lines[
+                        relevant_line_number_to_insert_tests_after:
+                    ]
                 )
                 # insert the additional imports at line 'relevant_line_number_to_insert_imports_after'
                 processed_test = "\n".join(processed_test_lines)
-                if relevant_line_number_to_insert_imports_after and additional_imports and additional_imports not in processed_test:
+                if (
+                    relevant_line_number_to_insert_imports_after
+                    and additional_imports
+                    and additional_imports not in processed_test
+                ):
                     additional_imports_lines = additional_imports.split("\n")
                     processed_test_lines = (
-                        processed_test_lines[:relevant_line_number_to_insert_imports_after]
+                        processed_test_lines[
+                            :relevant_line_number_to_insert_imports_after
+                        ]
                         + additional_imports_lines
-                        + processed_test_lines[relevant_line_number_to_insert_imports_after:]
+                        + processed_test_lines[
+                            relevant_line_number_to_insert_imports_after:
+                        ]
                     )
-                    self.relevant_line_number_to_insert_tests_after += len(additional_imports_lines) # this is important, otherwise the next test will be inserted at the wrong line
                 processed_test = "\n".join(processed_test_lines)
-
                 with open(self.test_file_path, "w") as test_file:
                     test_file.write(processed_test)
+                    test_file.flush()
 
                 # Step 2: Run the test using the Runner class
-                self.logger.info(
-                    f'Running test with the following command: "{self.test_command}"'
-                )
-                stdout, stderr, exit_code, time_of_test_command = Runner.run_command(
-                    command=self.test_command, cwd=self.test_command_dir
-                )
+                # Run the test command multiple times if num_attempts > 1
+                for i in range(num_attempts):
+                    self.logger.info(
+                        f'Running test with the following command: "{self.test_command}"'
+                    )
+                    stdout, stderr, exit_code, time_of_test_command = Runner.run_command(
+                        command=self.test_command, cwd=self.test_command_dir
+                    )
+                    if exit_code != 0:
+                        break
+                
 
                 # Step 3: Check for pass/fail from the Runner object
                 if exit_code != 0:
@@ -414,24 +565,31 @@ class UnitTestGenerator:
                         "stderr": stderr,
                         "stdout": stdout,
                         "test": generated_test,
+                        "language": self.language,
+                        "prompt": self.prompt["user"],
+                        "source_file": self.source_code,
+                        "original_test_file": original_content,
+                        "processed_test_file": processed_test,
                     }
 
-                    error_message = extract_error_message_python(fail_details["stdout"])
+                    error_message = self.extract_error_message(stderr=fail_details["stderr"], stdout=fail_details["stdout"])
                     if error_message:
-                        logging.error(f"Error message:\n{error_message}")
+                        logging.error(f"Error message summary:\n{error_message}")
 
                     self.failed_test_runs.append(
                         {"code": generated_test, "error_message": error_message}
                     )  # Append failure details to the list
 
-                    if 'WANDB_API_KEY' in os.environ:
+                    if "WANDB_API_KEY" in os.environ:
                         fail_details["error_message"] = error_message
                         root_span = Trace(
-                            name="fail_details_" + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+                            name="fail_details_"
+                            + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
                             kind="llm",  # kind can be "llm", "chain", "agent" or "tool
                             inputs={"test_code": fail_details["test"]},
-                            outputs=fail_details)
-                        root_span.log(name='inference')
+                            outputs=fail_details,
+                        )
+                        root_span.log(name="inference")
 
                     return fail_details
 
@@ -442,17 +600,44 @@ class UnitTestGenerator:
                         file_path=self.code_coverage_report_path,
                         src_file_path=self.source_file_path,
                         coverage_type=self.coverage_type,
+                        use_report_coverage_feature_flag=self.use_report_coverage_feature_flag,
                     )
-                    _, _, new_percentage_covered = (
-                        new_coverage_processor.process_coverage_report(
+                    coverage_percentages = {}
+
+                    if self.use_report_coverage_feature_flag:
+                        self.logger.info(
+                            "Using the report coverage feature flag to process the coverage report"
+                        )
+                        file_coverage_dict = new_coverage_processor.process_coverage_report(
                             time_of_test_command=time_of_test_command
                         )
-                    )
+                        total_lines_covered = 0
+                        total_lines_missed = 0
+                        total_lines = 0
+                        for key in file_coverage_dict:
+                            lines_covered, lines_missed, percentage_covered = (
+                                file_coverage_dict[key]
+                            )
+                            total_lines_covered += len(lines_covered)
+                            total_lines_missed += len(lines_missed)
+                            total_lines += len(lines_covered) + len(lines_missed)
+                            if key not in coverage_percentages:
+                                coverage_percentages[key] = 0
+                            coverage_percentages[key] = percentage_covered
+
+                        new_percentage_covered = total_lines_covered / total_lines
+                    else:
+                        _, _, new_percentage_covered = (
+                            new_coverage_processor.process_coverage_report(
+                                time_of_test_command=time_of_test_command
+                            )
+                        )
 
                     if new_percentage_covered <= self.current_coverage:
                         # Coverage has not increased, rollback the test by removing it from the test file
                         with open(self.test_file_path, "w") as test_file:
                             test_file.write(original_content)
+                            test_file.flush()
                         self.logger.info(
                             "Test did not increase coverage. Rolling back."
                         )
@@ -463,29 +648,38 @@ class UnitTestGenerator:
                             "stderr": stderr,
                             "stdout": stdout,
                             "test": generated_test,
+                            "language": self.language,
+                            "prompt": self.prompt["user"],
+                            "source_file": self.source_code,
+                            "original_test_file": original_content,
+                            "processed_test_file": processed_test,
                         }
                         self.failed_test_runs.append(
                             {
                                 "code": fail_details["test"],
-                                "error_message": "did not increase code coverage",
+                                "error_message": "Code coverage did not increase",
                             }
                         )  # Append failure details to the list
 
-                        if 'WANDB_API_KEY' in os.environ:
+                        if "WANDB_API_KEY" in os.environ:
                             root_span = Trace(
-                                name="fail_details_"+datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+                                name="fail_details_"
+                                + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
                                 kind="llm",  # kind can be "llm", "chain", "agent" or "tool
                                 inputs={"test_code": fail_details["test"]},
-                                outputs=fail_details)
-                            root_span.log(name='inference')
+                                outputs=fail_details,
+                            )
+                            root_span.log(name="inference")
 
                         return fail_details
                 except Exception as e:
                     # Handle errors gracefully
                     self.logger.error(f"Error during coverage verification: {e}")
-                    # Optionally, roll back even in case of error
+                    # roll back even in case of error
                     with open(self.test_file_path, "w") as test_file:
                         test_file.write(original_content)
+                        test_file.flush()
+
                     fail_details = {
                         "status": "FAIL",
                         "reason": "Runtime error",
@@ -493,17 +687,41 @@ class UnitTestGenerator:
                         "stderr": stderr,
                         "stdout": stdout,
                         "test": generated_test,
+                        "language": self.language,
+                        "prompt": self.prompt["user"],
+                        "source_file": self.source_code,
+                        "original_test_file": original_content,
+                        "processed_test_file": processed_test,
                     }
                     self.failed_test_runs.append(
                         {
                             "code": fail_details["test"],
-                            "error_message": "coverage verification error",
+                            "error_message": "Coverage verification error",
                         }
                     )  # Append failure details to the list
                     return fail_details
 
-                # If everything passed and coverage increased, update current coverage and log success
+                # If we got here, everything passed and coverage increased - update current coverage and log success,
+                # and increase 'relevant_line_number_to_insert_tests_after' by the number of imports lines added
+                self.relevant_line_number_to_insert_tests_after += len(
+                    additional_imports_lines
+                )  # this is important, otherwise the next test will be inserted at the wrong line
+
                 self.current_coverage = new_percentage_covered
+
+                for key in coverage_percentages:
+                    if key not in self.last_coverage_percentages:
+                        self.last_coverage_percentages[key] = 0
+                    if coverage_percentages[key] > self.last_coverage_percentages[key] and key == self.source_file_path.split("/")[-1]:
+                        self.logger.info(
+                            f"Coverage for provided source file: {key} increased from {round(self.last_coverage_percentages[key] * 100, 2)} to {round(coverage_percentages[key] * 100, 2)}"
+                        )
+                    elif coverage_percentages[key] > self.last_coverage_percentages[key]:
+                        self.logger.info(
+                            f"Coverage for non-source file: {key} increased from {round(self.last_coverage_percentages[key] * 100, 2)} to {round(coverage_percentages[key] * 100, 2)}"
+                        )
+                    self.last_coverage_percentages[key] = coverage_percentages[key]
+
                 self.logger.info(
                     f"Test passed and coverage increased. Current coverage: {round(new_percentage_covered * 100, 2)}%"
                 )
@@ -514,6 +732,11 @@ class UnitTestGenerator:
                     "stderr": stderr,
                     "stdout": stdout,
                     "test": generated_test,
+                    "language": self.language,
+                    "prompt": self.prompt["user"],
+                    "source_file": self.source_code,
+                    "original_test_file": original_content,
+                    "processed_test_file": processed_test,
                 }
         except Exception as e:
             self.logger.error(f"Error validating test: {e}")
@@ -524,23 +747,70 @@ class UnitTestGenerator:
                 "stderr": str(e),
                 "stdout": "",
                 "test": generated_test,
+                "language": self.language,
+                "prompt": self.prompt["user"],
+                "source_file": self.source_code,
+                "original_test_file": original_content,
+                "processed_test_file": "N/A",
             }
 
+    def to_dict(self):
+        return {
+            "source_file_path": self.source_file_path,
+            "test_file_path": self.test_file_path,
+            "code_coverage_report_path": self.code_coverage_report_path,
+            "test_command": self.test_command,
+            "llm_model": self.llm_model,
+            "test_command_dir": self.test_command_dir,
+            "included_files": self.included_files,
+            "coverage_type": self.coverage_type,
+            "desired_coverage": self.desired_coverage,
+            "additional_instructions": self.additional_instructions,
+        }
 
-def extract_error_message_python(fail_message):
-    try:
-        # Define a regular expression pattern to match the error message
-        MAX_LINES = 20
-        pattern = r"={3,} FAILURES ={3,}(.*?)(={3,}|$)"
-        match = re.search(pattern, fail_message, re.DOTALL)
-        if match:
-            err_str = match.group(1).strip("\n")
-            err_str_lines = err_str.split("\n")
-            if len(err_str_lines) > MAX_LINES:
-                # show last MAX_lines lines
-                err_str = "...\n" + "\n".join(err_str_lines[-MAX_LINES:])
-            return err_str
-        return ""
-    except Exception as e:
-        logging.error(f"Error extracting error message: {e}")
-        return ""
+    def to_json(self):
+        return json.dumps(self.to_dict())
+
+
+    def extract_error_message(self, stderr, stdout):
+        """
+        Extracts the error message from the provided stderr and stdout outputs.
+
+        Updates the PromptBuilder object with the stderr and stdout, builds a custom prompt for analyzing test run failures,
+        calls the language model to analyze the prompt, and loads the response into a dictionary.
+        
+        Returns the error summary from the loaded YAML data or a default error message if unable to summarize.
+        Logs errors encountered during the process.
+
+        Parameters:
+            stderr (str): The standard error output from the test run.
+            stdout (str): The standard output from the test run.
+
+        Returns:
+            str: The error summary extracted from the response or a default error message if extraction fails.
+        """
+        try:
+            # Update the PromptBuilder object with stderr and stdout
+            self.prompt_builder.stderr_from_run = stderr
+            self.prompt_builder.stdout_from_run = stdout
+
+            # Build the prompt
+            prompt_headers_indentation = self.prompt_builder.build_prompt_custom(
+                file="analyze_test_run_failure"
+            )
+
+            # Run the analysis via LLM
+            self.ai_caller.model = "gpt-4o" if self.llm_model in ["o1-preview", "o1-mini"] else self.llm_model # Exception for OpenAI's new reasoning engines
+            response, prompt_token_count, response_token_count = (
+                self.ai_caller.call_model(prompt=prompt_headers_indentation, stream=False)
+            )
+            self.ai_caller.model = self.llm_model # Reset
+            self.total_input_token_count += prompt_token_count
+            self.total_output_token_count += response_token_count
+            tests_dict = load_yaml(response)
+            
+            return tests_dict.get("error_summary", f"ERROR: Unable to summarize error message from inputs. STDERR: {stderr}\nSTDOUT: {stdout}.")
+        except Exception as e:
+            logging.error(f"ERROR: Unable to extract error message from inputs using LLM.\nSTDERR: {stderr}\nSTDOUT: {stdout}")
+            logging.error(f"Error extracting error message: {e}")
+            return ""

@@ -1,4 +1,6 @@
+import os
 import pytest
+import tempfile
 from unittest.mock import patch, mock_open
 from cover_agent.PromptBuilder import PromptBuilder
 
@@ -142,9 +144,12 @@ class TestPromptBuilder:
     def test_build_prompt_custom_handles_rendering_exception(self, monkeypatch):
         def mock_render(*args, **kwargs):
             raise Exception("Rendering error")
-        
-        monkeypatch.setattr("jinja2.Environment.from_string", lambda *args, **kwargs: type('', (), {"render": mock_render})())
-        
+
+        monkeypatch.setattr(
+            "jinja2.Environment.from_string",
+            lambda *args, **kwargs: type("", (), {"render": mock_render})(),
+        )
+
         builder = PromptBuilder(
             source_file_path="source_path",
             test_file_path="test_path",
@@ -153,13 +158,15 @@ class TestPromptBuilder:
         result = builder.build_prompt_custom("custom_file")
         assert result == {"system": "", "user": ""}
 
-
     def test_build_prompt_handles_rendering_exception(self, monkeypatch):
         def mock_render(*args, **kwargs):
             raise Exception("Rendering error")
-        
-        monkeypatch.setattr("jinja2.Environment.from_string", lambda *args, **kwargs: type('', (), {"render": mock_render})())
-        
+
+        monkeypatch.setattr(
+            "jinja2.Environment.from_string",
+            lambda *args, **kwargs: type("", (), {"render": mock_render})(),
+        )
+
         builder = PromptBuilder(
             source_file_path="source_path",
             test_file_path="test_path",
@@ -168,3 +175,33 @@ class TestPromptBuilder:
         result = builder.build_prompt()
         assert result == {"system": "", "user": ""}
 
+class TestPromptBuilderEndToEnd:
+    def test_custom_analyze_test_run_failure(self):
+        # Create fake source and test files and tmp files and pass in the paths
+        source_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        source_file.write("def foo():\n    pass")
+        source_file.close()
+        test_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        test_file.write("def test_foo():\n    pass")
+        test_file.close()
+        tmp_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        tmp_file.write("tmp file content")
+        tmp_file.close()
+
+        builder = PromptBuilder(
+            source_file_path=source_file.name,
+            test_file_path=test_file.name,
+            code_coverage_report=tmp_file.name,
+        )
+
+        builder.stderr_from_run = "stderr content"
+        builder.stdout_from_run = "stdout content"
+
+        result = builder.build_prompt_custom("analyze_test_run_failure")
+        assert "stderr content" in result["user"]
+        assert "stdout content" in result["user"]
+
+        # Clean up
+        os.remove(source_file.name)
+        os.remove(test_file.name)
+        os.remove(tmp_file.name)
